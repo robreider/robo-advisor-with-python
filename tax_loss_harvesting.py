@@ -286,40 +286,60 @@ def update_lots_with_trades(lots: pd.DataFrame,
     return updated_lots
 
 
-def evaluate_tcost(lot, current_price, tax_rate, sell_spread, buy_spread,
-                   commission_rate):
-    loss = lot['quantity'] * (current_price - lot['purchase_price'])
+def evaluate_tcost(lot: pd.Series, current_price: float,
+                   sell_spread: float, buy_spread: float,
+                   commission_rate: float = 0):
+    """ Evaluate a loss harvest based on the cost to execute it
+
+    :param lot: A single tax lot
+    :param current_price: Current price of the asset
+    :param sell_spread: Estimated bid/ask spread on the asset being sold
+    :param buy_spread: Estimated bid/ask spread on the asset being bought
+    :param commission_rate: Commission rate for trades
+    :return: Tax benefit less the cost of trading
+    """
     trade_size = lot['quantity'] * current_price
 
     spread_cost = (buy_spread + sell_spread) * trade_size
     commission_cost = 2 * commission_rate * trade_size
 
-    benefit = loss * tax_rate
-
-    return benefit - (spread_cost + commission_cost)
+    return lot['tax_benefit'] - (spread_cost + commission_cost)
 
 
-def evaluate_opp_cost(lot, price, current_date, st_rate, lt_rate,
-                      sigma, risk_free, div_yield):
+def evaluate_opp_cost(lot: pd.Series, price: float, current_date: dt.date,
+                      tax_params: Dict, sigma: float, risk_free: float,
+                      div_yield: float):
+    """ Evaluate a loss harvest based on the opportunity cost vs the tax
+    benefit
 
-    holding_period = (current_date - lot['purchase_date']).days
-    if holding_period >= 365:
-        rate_now = rate_later = lt_rate
+    :param lot: A single tax lot
+    :param price: Current asset price
+    :param current_date: Current date
+    :param tax_params: Dict with tax rates and cutoff
+    :param sigma: Volatility of the asset
+    :param risk_free: Risk-free rate
+    :param div_yield: Dividend yield of the asset
+    :return: Tax benefit less the opportunity cost of harvesting
+    """
+    purchase_date = dt.date.fromisoformat(lot['purchase_date'])
+    holding_period = (current_date - purchase_date).days
+    if holding_period >= tax_params['lt_cutoff']:
+        rate_now = rate_later = tax_params['lt_rate']
     else:
-        rate_now = st_rate
-        rate_later = lt_rate
+        rate_now = tax_params['st_rate']
+        rate_later = tax_params['lt_rate']
+    price = float(price)
 
-    o_full = Option(european=False, kind='put', s0=price, strike=price,
+    o_full = Option(european=False, kind='put', s0=price, k=price,
                     t=30, sigma=sigma, r=risk_free, dv=div_yield)
     p_full = o_full.getPrice('BT')
 
-    days_til_switch = 365 - holding_period
-    if 0 <= days_til_switch <= 30:
-
-        o_til_switch = Option(european=False, kind='put', s0=price,
-                              strike=price, t=days_til_switch, sigma=sigma,
+    days_to_switch = tax_params['lt_cutoff'] - holding_period
+    if 0 < days_to_switch <= 30:
+        o_pre_switch = Option(european=False, kind='put', s0=price,
+                              k=price, t=days_to_switch, sigma=sigma,
                               r=risk_free, dv=div_yield)
-        p_til_switch = o_til_switch.getPrice('BT')
+        p_til_switch = o_pre_switch.getPrice('BT')
         p_after_switch = p_full - p_til_switch
 
         opp_cost = rate_now * p_til_switch + rate_later * p_after_switch
@@ -329,3 +349,130 @@ def evaluate_opp_cost(lot, price, current_date, st_rate, lt_rate,
     benefit = rate_now * (lot['purchase_price'] - price)
 
     return benefit - opp_cost
+
+
+def find_eligible_replacements(etf_set, lots, current_date):
+    """ Find all ETFs from a given set that for that would not create a
+    wash sale if they were purchased today.
+
+    :param etf_set: Set of potential "replacement" ETFs
+    :param lots: Tax lots
+    :param current_date: Current date
+    :return: A set of tickers that are considered replacements for the
+        provided ticker and have not been recently sold at a loss
+    """
+    lots = lots[lots['sell_date'] == lots['sell_date']]
+    lots = lots[lots['ticker'].isin(etf_set)]
+    lots = lots[lots['sell_price'] < lots['purchase_price']]
+    hp = lots.apply(lambda x: (current_date -
+                               dt.date.fromisoformat(x['sell_date'])).days,
+                    axis=1)
+    lots = lots.loc[hp[hp <= 30].index]
+
+    return [x for x in etf_set if x not in lots['ticker'].values]
+
+
+def evaluate_harvest(lot, lots, replacements, current_date, prices, tax_params,
+                     sigma, risk_free, div_yield, spreads, tickers_selling):
+    """ Given a lot trading at a loss, decide whether or not the lot
+    ahould be harvested, and which ETF can replace the one currently held
+
+    :param lot: Tax lot being considered for harvesting
+    :param lots: All other tax lots
+    :param replacements: Potential replacement ETFs for the one being
+        considered for harvesting
+    :param current_date: The current date
+    :param prices: Prices of all ETFs
+    :param tax_params: Tax rates and long-term/short-term cutoff
+    :param sigma: volatility of the ETF considered for harvesting
+    :param risk_free: Current risk-free rate
+    :param div_yield: Dividend yield of the ETF considered for harvesting
+    :param spreads: Assumed bid/ask spreads
+    :param tickers_selling: Tickers being harvested already
+    :return: The trade information, if possible and beneficial
+    """
+    replacements = \
+        find_eligible_replacements(replacements, lots, current_date)
+    replacements = [x for x in replacements if x not in tickers_selling]
+    if len(replacements) == 0:
+        return None
+    ticker = lot['ticker']
+    replacement = replacements[0]
+    benefit_net_tcosts = evaluate_tcost(lot, prices[ticker],
+                                        spreads[ticker],
+                                        spreads[replacement])
+    benefit_net_oppcost = evaluate_opp_cost(lot, prices[ticker],
+                                            current_date,
+                                            tax_params,
+                                            sigma, risk_free, div_yield)
+
+    if benefit_net_tcosts < 0 or benefit_net_oppcost < 0:
+        return None
+
+    value = lot['quantity'] * prices[ticker]
+    res = pd.Series([ticker, lot['purchase_date'], value, replacement],
+                    ['sell_ticker', 'purchase_date', 'value', 'buy_ticker'])
+    return res
+
+
+def get_replacement_set(ticker: str):
+    """ Find potential replacement ETFs for a given ticker
+
+    :param ticker: ETF being considered for a tax loss harvest
+    :return: Set of tickers considered exchangeable with the input ETF
+    """
+    etf_sets = (('VTI', 'SCHB', 'ITOT', 'SPTM'),
+                ('VEA', 'SCHF', 'IEFA'))
+
+    for s in etf_sets:
+        if ticker in s:
+            s = list(s)
+            s.remove(ticker)
+            return s
+    return []
+
+
+def evaluate_all_harvests(lots, current_date, prices, tax_params, sigmas,
+                          risk_free, div_yields, spreads):
+    """
+
+    :param lots: DataFrame of tax lots
+    :param current_date: Date of harvest evaluation
+    :param prices: ETF prices - should include all harvestable ETFs
+    :param tax_params: Dict of tax parameters
+    :param sigmas: Asset volatilities
+    :param risk_free: Current risk-free rate
+    :param div_yields: Asset dividend yields
+    :param spreads: Bid/ask spreads
+    :return: DataFrame with harvests to execute
+    """
+    all_lots = lots.copy()
+    lots = lots[lots['sell_price'] != lots['sell_price']].copy()
+    gains = (prices[lots['ticker']].values - lots['purchase_price'])
+    lots['gain'] = lots['quantity'] * gains
+    lots = lots[lots['gain'] < 0]
+    lots['hp'] =\
+        list(map(lambda d: (current_date - dt.date.fromisoformat(d)).days,
+                 lots['purchase_date']))
+    lots['tax_rate'] = tax_params['st_rate']
+    idx = lots['hp'][lots['hp'] >= tax_params['lt_cutoff']].index
+    lots.loc[idx, 'tax_rate'] = tax_params['lt_rate']
+    lots['tax_benefit'] = -lots['gain'] * lots['tax_rate']
+    lots = lots.sort_values(by='tax_benefit', ascending=False)
+
+    harvests, buying, selling = [], [], []
+    for i, lot in lots.iterrows():
+        ticker = lot['ticker']
+        replacements = get_replacement_set(ticker)
+        result = evaluate_harvest(lot, all_lots, replacements, current_date,
+                                  prices, tax_params, sigmas[ticker],
+                                  risk_free, div_yields[ticker], spreads,
+                                  selling)
+        if result is not None and ticker not in buying:
+            harvests.append(result)
+            buying.append(result['buy_ticker'])
+            selling.append(ticker)
+
+    harvests = pd.DataFrame(harvests)
+    return harvests
+
