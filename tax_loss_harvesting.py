@@ -1,12 +1,12 @@
 import datetime as dt
-from typing import Tuple, Dict, List
+from typing import Tuple, Dict, List, Union
 
 import numpy as np
 from optionprice import Option
 import pandas as pd
 
 
-def _sellable(lot: pd.Series, new_lots: pd.Series) -> pd.Series:
+def sellable(lot: pd.Series, new_lots: pd.Series) -> pd.Series:
     """ Check whether a lot can be sold without creating a wash sale
 
     :param lot: Information about the tax lot
@@ -19,10 +19,10 @@ def _sellable(lot: pd.Series, new_lots: pd.Series) -> pd.Series:
 
     idx = ['sellable', 'blocking_lots']
     if not lot['still_held']:
-        return pd.Series([False, []], idx)
+        return pd.Series([False, pd.Series(dtype='str')], idx)
 
     if not lot['is_at_loss']:
-        return pd.Series([True, []], idx)
+        return pd.Series([True, pd.Series(dtype='str')], idx)
 
     if lot['is_new'] and len(new_lots) > 1:
         blocking_lots = new_lots[new_lots != lot.purchase_date]
@@ -31,10 +31,10 @@ def _sellable(lot: pd.Series, new_lots: pd.Series) -> pd.Series:
     if not lot['is_new'] and len(new_lots) > 0:
         return pd.Series([False, new_lots], idx)
 
-    return pd.Series([True, []], idx)
+    return pd.Series([True, pd.Series(dtype='str')], idx)
 
 
-def _blocks_buying(lot: pd.Series, current_date: dt.date) -> bool:
+def blocks_buying(lot: pd.Series, current_date: dt.date) -> bool:
     """ Check whether a lot prevents us from buying an asset, because it
     was recently sold at a loss
 
@@ -69,9 +69,9 @@ def check_asset_for_restrictions(lots: pd.DataFrame,
                                   lots['purchase_price']))
     lots['still_held'] = list(map(lambda x: x != x, lots['sell_date']))
     new_lots = lots[lots['is_new'] & lots['still_held']]['purchase_date']
-    sellability = {i: _sellable(lots.loc[i], new_lots) for i in lots.index}
+    sellability = {i: sellable(lots.loc[i], new_lots) for i in lots.index}
     lots = lots.join(pd.DataFrame(sellability).T)
-    buy_blocks = list(map(lambda x: _blocks_buying(x[1], current_date),
+    buy_blocks = list(map(lambda x: blocks_buying(x[1], current_date),
                           lots.iterrows()))
     buy_blocks = pd.Series(buy_blocks, lots.index)
     lots['blocks_buy'] = buy_blocks
@@ -92,7 +92,7 @@ def check_all_assets_for_restrictions(lots: pd.DataFrame,
         - First is a dataframe of lots with the 'can_sell' flag added
         - Second is a Dict, with an entry for each asset indicating blocks
     """
-    tickers = current_prices.index
+    tickers = lots['ticker'].unique()
     results = []
     for ticker in tickers:
         asset_lots = lots[lots['ticker'] == ticker].copy()
@@ -106,7 +106,15 @@ def check_all_assets_for_restrictions(lots: pd.DataFrame,
     return results
 
 
-def create_new_lots(buys, current_date, current_prices):
+def create_new_lots(buys: Dict, current_date: dt.date,
+                    current_prices: pd.Series):
+    """ Create new tax lots from buy trades
+
+    :param buys: New purchases
+    :param current_date: The current date
+    :param current_prices: Current asset prices
+    :return: A data frame holding tax lot information for the purchases
+    """
     new_lots = []
     for ticker, buy_amount in buys.items():
         idx = ['ticker', 'purchase_price', 'quantity', 'purchase_date',
@@ -121,11 +129,12 @@ def create_new_lots(buys, current_date, current_prices):
     return pd.DataFrame(new_lots)
 
 
-def adjust_lots_with_buys(lots: pd.DataFrame,
+def update_lots_with_buys(lots: pd.DataFrame,
                           buys: Dict,
                           current_date: dt.date,
                           current_prices: pd.Series) -> Tuple:
-    """
+    """ Update existing lots with buys, adjusting cost basis for wash sales
+    where necessary
 
     :param lots: Current holdings, with information about wash sale
         restrictions
@@ -174,7 +183,152 @@ def adjust_lots_with_buys(lots: pd.DataFrame,
     return new_lots, leftover_lots, lots
 
 
-def close_lots(lots, sells, current_date, current_prices):
+def update_lot(lot: pd.Series, idx: List[str], values: List):
+    """ Helper function to create a new lot by updating an existing one
+
+    :param lot: Series representing a tax lot
+    :param idx: List of indices to put the replacement data
+    :param values: replacement data
+    :return: A new lot with the replacement data in the right places
+    """
+    new_lot = lot.copy()
+    new_lot[idx] = values
+    return new_lot
+
+
+def close_unblocked_lots(lots: pd.DataFrame, sells: Dict,
+                         current_date: dt.date, current_prices: pd.Series):
+    """ Update tax lots for sales that don't create any wash sales
+
+    :param lots: DataFrame of tax lots
+    :param sells: Dictionary of sells, by asset and purchase date
+    :param current_date: The current date
+    :param current_prices: Current asset prices
+    :return: Three DataFrames. First has closed tax lots. Second has
+        still-open lots. Third has sells that have not been accounted for
+        yet (because they could create washes)
+    """
+    lots = lots.copy()
+    closed_lots = []
+    remaining_sells = {k: {} for k in sells}
+    for ticker, ticker_sells in sells.items():
+        ticker_lots = lots[np.isnan(lots['sell_price']) *
+                           lots['ticker'] == ticker]
+        for purchase_date, sell_value in ticker_sells.items():
+            i = ticker_lots['purchase_date'].tolist().index(purchase_date)
+            i = ticker_lots.index[i]
+            sold_lot = lots.loc[i]
+            if len(sold_lot['blocking_lots']):
+                remaining_sells[ticker][sold_lot['purchase_date']] = \
+                    sell_value
+                continue
+            sold_shares = sell_value / current_prices[ticker]
+            idx = ['quantity', 'sell_date', 'sell_price', 'wash_sale']
+            val = [sold_shares, current_date.strftime('%Y-%m-%d'),
+                   current_prices[ticker], not sold_lot['sellable']]
+            closed_lot = update_lot(sold_lot, idx, val)
+            closed_lots.append(closed_lot)
+
+            remaining_shares = sold_lot['quantity'] - sold_shares
+            if remaining_shares > 0:
+                remainder_lot = sold_lot.copy()
+                remainder_lot['quantity'] = remaining_shares
+                lots.loc[i] = remainder_lot
+            else:
+                lots = lots.drop(i)
+    closed_lots = pd.DataFrame(closed_lots, columns=lots.columns)
+
+    return closed_lots, lots, remaining_sells
+
+
+def calculate_remaining_quantities(lots: pd.DataFrame, sells: Dict,
+                                   current_prices: pd.Series):
+    """ Calculate the number of shares remaining in tax lots after any
+    sales
+
+    :param lots: DataFrame of tax lots
+    :param sells: Dictionary of sells, by asset and purchase date
+    :param current_prices: Current asset prices
+    :return: Copy of the tax lots with a new column showing the number of
+        shares that remain AFTER sales
+    """
+    lots = lots.copy()
+    remaining_quantities = pd.Series(0, lots.index)
+    for (i, lot) in lots.iterrows():
+        if not np.isnan(lot['sell_date']):
+            continue
+        ticker = lot['ticker']
+        ticker_sells = sells.get(ticker, {})
+        purchase_date = lot['purchase_date']
+        lot_sale = ticker_sells.get(purchase_date, 0)
+        remaining_quantities[i] = \
+            lot['quantity'] - lot_sale / current_prices[ticker]
+    lots['remaining_quantity'] = remaining_quantities
+
+    return lots
+
+
+def update_ticker_lots_with_wash_sells(lots, sells, current_date,
+                                       current_price):
+    """ Adjust lots for a single ticker for sales that could create washes
+
+    :param lots: Current holdings, with information about wash sale
+        restrictions
+    :param sells: Dictionary of asset sales (in dollars)
+    :param current_date: The current date
+    :param current_price: Current asset price
+    :return: Two data frames. First has newly closed lots, and second has
+        lots that are still open
+    """
+    lots = lots.copy()
+    closed_lots, adjustments = [], []
+    blocking_lots = lots['blocking_lots']
+    idx = np.unique(np.concatenate([x.index.values for x in blocking_lots]))
+    blocking_shares = lots.loc[pd.Index(idx), 'remaining_quantity']
+    date_str = current_date.strftime('%Y-%m-%d')
+    for purchase_date, sell_value in sells.items():
+        i = lots.index[lots['purchase_date'].tolist().index(purchase_date)]
+        sold_lot = lots.loc[i]
+        shares_sold = sell_value / current_price
+        blocking_lots = sold_lot['blocking_lots'].sort_values()
+        blocks_idx = blocking_lots.index
+        shares_washed = \
+            min(shares_sold, blocking_shares[blocks_idx].sum())
+        loss_to_wash = shares_washed * \
+            (sold_lot['purchase_price'] - current_price)
+
+        idx = ['quantity', 'sell_date', 'sell_price', 'wash_sale']
+        if shares_washed > 0:
+            val = [shares_washed, date_str, current_price, True]
+            closed_lots.append(update_lot(sold_lot, idx, val))
+            adjustments.append((blocking_lots, loss_to_wash))
+            shares = blocking_shares[blocks_idx].cumsum() - shares_washed
+            blocking_shares[blocks_idx] = np.clip(shares, 0, np.Inf)
+
+        if shares_sold > shares_washed:
+            val = [shares_sold - shares_washed, date_str, current_price,
+                   False]
+            closed_lots.append(update_lot(sold_lot, idx, val))
+
+        if sold_lot['quantity'] > shares_sold:
+            remainder_lot = sold_lot.copy()
+            remainder_lot['quantity'] -= shares_sold
+            lots.loc[i] = remainder_lot
+        else:
+            lots.drop(i, axis='index', inplace=True)
+
+    for blocking_lots, wash_amount in adjustments:
+        for purchase_date in blocking_lots.values:
+            idx = lots[lots['purchase_date'] == purchase_date].index
+            if len(idx) == 0:
+                continue
+            adj_per_share = wash_amount / lots.loc[idx[0], 'quantity']
+            lots.loc[idx[0], 'purchase_price'] += adj_per_share
+
+    return pd.DataFrame(closed_lots), lots
+
+
+def update_with_wash_sells(lots, sells, current_date, current_prices):
     """ Adjust lots for sales (no wash sale adjustments)
 
     :param lots: Current holdings, with information about wash sale
@@ -185,57 +339,21 @@ def close_lots(lots, sells, current_date, current_prices):
     :return: Two data frames. First has still-held lots, and second has
         newly-closed lots.
     """
-    lots = lots.copy()
-    closed_lots = []
+    lots = calculate_remaining_quantities(lots, sells, current_prices)
+    closed_lots, open_lots = [], []
     for ticker, ticker_sells in sells.items():
-        ticker_lots = lots[np.isnan(lots['sell_price']) *
-                           lots['ticker'] == ticker]
-        for purchase_date, sell_value in ticker_sells.items():
-            i = ticker_lots['purchase_date'].tolist().index(purchase_date)
-            i = ticker_lots.index[i]
-            sold_lot = lots.loc[i]
-            sold_shares = sell_value / current_prices[ticker]
-            closed_lot = sold_lot.copy()
-            idx = ['quantity', 'sell_date', 'sell_price', 'wash_sale']
-            closed_lot[idx] = [sold_shares,
-                               current_date.strftime('%Y-%m-%d'),
-                               current_prices[ticker],
-                               not closed_lot['sellable']]
-            closed_lots.append(closed_lot)
+        ticker_lots = lots[lots['ticker'] == ticker]
+        price = current_prices[ticker]
+        ticker_res = \
+            update_ticker_lots_with_wash_sells(ticker_lots, ticker_sells,
+                                               current_date, price)
+        closed_lots.append(ticker_res[0])
+        open_lots.append(ticker_res[1])
 
-            remaining_shares = sold_lot['quantity'] - sold_shares
-            if remaining_shares > 0:
-                remainder_lot = sold_lot.copy()
-                remainder_lot['quantity'] = remaining_shares
-                lots.loc[i] = remainder_lot
-            else:
-                lots = lots.drop(i)
-
-    return pd.DataFrame(closed_lots, columns=lots.columns), lots
+    return pd.concat(closed_lots), pd.concat(open_lots)
 
 
-def adjust_for_wash_sales(closed_lots, lots):
-    """ Adjust lots for wash sales caused by selling
-
-    :param closed_lots: Lots that have just been sold
-    :param lots: Remaining (still-open) lots
-    :return: Lots with cost basis adjusted for any wash sales in the
-        recent sales
-    """
-    wash_sales = closed_lots[closed_lots['wash_sale']]
-    for _, sold_lot in wash_sales.iterrows():
-        blocking_lots = sold_lot['blocking_lots'].sort_values()
-        held_lots = blocking_lots.index.intersection(lots.index)
-        washed_loss = sold_lot['quantity'] * (sold_lot['purchase_price'] -
-                                              sold_lot['sell_price'])
-        if len(held_lots):
-            lots.loc[held_lots[0], 'purchase_price'] += washed_loss / \
-                                                        lots.loc[held_lots[0], 'quantity']
-
-    return lots
-
-
-def adjust_lots_for_sells(lots: pd.DataFrame,
+def update_lots_for_sells(lots: pd.DataFrame,
                           sells: Dict,
                           current_date: dt.date,
                           current_prices: pd.Series) -> Tuple:
@@ -249,11 +367,14 @@ def adjust_lots_for_sells(lots: pd.DataFrame,
     :return: Two data frames. First has still-held lots with any adjustments
         for wash sales. Second has newly-closed lots.
     """
-    closed_lots, lots = close_lots(lots, sells, current_date,
-                                   current_prices)
-    lots = adjust_for_wash_sales(closed_lots, lots)
+    unblocked_res = \
+        close_unblocked_lots(lots, sells, current_date, current_prices)
+    updates = update_with_wash_sells(unblocked_res[1], unblocked_res[2],
+                                     current_date, current_prices)
 
-    return lots, closed_lots
+    closed_lots = pd.concat((unblocked_res[0], updates[0]))
+
+    return updates[1], closed_lots
 
 
 def update_lots_with_trades(lots: pd.DataFrame,
@@ -273,15 +394,15 @@ def update_lots_with_trades(lots: pd.DataFrame,
     :return: Two data frames. First has still-held lots with any adjustments
         for wash sales. Second has newly-closed lots.
     """
-    lots, closed_lots = adjust_lots_for_sells(lots, sells, current_date,
+    lots, closed_lots = update_lots_for_sells(lots, sells, current_date,
                                               current_prices)
-    new_lots, leftover_lots, lots = adjust_lots_with_buys(lots, buys,
+    new_lots, leftover_lots, lots = update_lots_with_buys(lots, buys,
                                                           current_date,
                                                           current_prices)
     updated_lots = pd.concat((closed_lots, lots, leftover_lots, new_lots),
                              ignore_index=True)
-    updated_lots.drop(['sellable', 'blocking_lots', 'blocks_buy'],
-                      axis=1, inplace=True)
+    updated_lots.drop(['sellable', 'blocking_lots', 'blocks_buy',
+                       'remaining_quantity'], axis=1, inplace=True)
 
     return updated_lots
 
@@ -299,7 +420,6 @@ def evaluate_tcost(lot: pd.Series, current_price: float,
     :return: Tax benefit less the cost of trading
     """
     trade_size = lot['quantity'] * current_price
-
     spread_cost = (buy_spread + sell_spread) * trade_size
     commission_cost = 2 * commission_rate * trade_size
 
@@ -351,36 +471,15 @@ def evaluate_opp_cost(lot: pd.Series, price: float, current_date: dt.date,
     return benefit - opp_cost
 
 
-def find_eligible_replacements(etf_set, lots, current_date):
-    """ Find all ETFs from a given set that for that would not create a
-    wash sale if they were purchased today.
-
-    :param etf_set: Set of potential "replacement" ETFs
-    :param lots: Tax lots
-    :param current_date: Current date
-    :return: A set of tickers that are considered replacements for the
-        provided ticker and have not been recently sold at a loss
-    """
-    lots = lots[lots['sell_date'] == lots['sell_date']]
-    lots = lots[lots['ticker'].isin(etf_set)]
-    lots = lots[lots['sell_price'] < lots['purchase_price']]
-    hp = lots.apply(lambda x: (current_date -
-                               dt.date.fromisoformat(x['sell_date'])).days,
-                    axis=1)
-    lots = lots.loc[hp[hp <= 30].index]
-
-    return [x for x in etf_set if x not in lots['ticker'].values]
-
-
-def evaluate_harvest(lot, lots, replacements, current_date, prices, tax_params,
-                     sigma, risk_free, div_yield, spreads, tickers_selling):
+def evaluate_harvest(lot: pd.Series, replacement: str,
+                     current_date: dt.date, prices: pd.Series,
+                     tax_params: Dict, sigma: float, risk_free: float,
+                     div_yield: float, spreads: pd.Series):
     """ Given a lot trading at a loss, decide whether or not the lot
-    ahould be harvested, and which ETF can replace the one currently held
+    should be harvested
 
     :param lot: Tax lot being considered for harvesting
-    :param lots: All other tax lots
-    :param replacements: Potential replacement ETFs for the one being
-        considered for harvesting
+    :param replacement: ETF to buy as a replacement
     :param current_date: The current date
     :param prices: Prices of all ETFs
     :param tax_params: Tax rates and long-term/short-term cutoff
@@ -388,16 +487,9 @@ def evaluate_harvest(lot, lots, replacements, current_date, prices, tax_params,
     :param risk_free: Current risk-free rate
     :param div_yield: Dividend yield of the ETF considered for harvesting
     :param spreads: Assumed bid/ask spreads
-    :param tickers_selling: Tickers being harvested already
-    :return: The trade information, if possible and beneficial
+    :return: Harvest trade information
     """
-    replacements = \
-        find_eligible_replacements(replacements, lots, current_date)
-    replacements = [x for x in replacements if x not in tickers_selling]
-    if len(replacements) == 0:
-        return None
     ticker = lot['ticker']
-    replacement = replacements[0]
     benefit_net_tcosts = evaluate_tcost(lot, prices[ticker],
                                         spreads[ticker],
                                         spreads[replacement])
@@ -405,36 +497,78 @@ def evaluate_harvest(lot, lots, replacements, current_date, prices, tax_params,
                                             current_date,
                                             tax_params,
                                             sigma, risk_free, div_yield)
-
-    if benefit_net_tcosts < 0 or benefit_net_oppcost < 0:
+    if min(benefit_net_tcosts, benefit_net_oppcost) < 0:
         return None
 
     value = lot['quantity'] * prices[ticker]
-    res = pd.Series([ticker, lot['purchase_date'], value, replacement],
-                    ['sell_ticker', 'purchase_date', 'value', 'buy_ticker'])
-    return res
+    return pd.Series([ticker, lot['purchase_date'], value, replacement],
+                     ['ticker', 'purchase_date', 'amount', 'replacement'])
 
 
-def get_replacement_set(ticker: str):
-    """ Find potential replacement ETFs for a given ticker
+def evaluate_harvests_for_etf_set(lots, current_date, prices, tax_params,
+                                  sigmas, risk_free, div_yields,
+                                  spreads, etf_set):
+    """ Decide whether or not to harvest eligible lots from holdings
+    belonging to one set of exchangeable ETFs
 
-    :param ticker: ETF being considered for a tax loss harvest
-    :return: Set of tickers considered exchangeable with the input ETF
+    :param lots: DataFrame of tax lots for ETFs from one TLH set
+    :param current_date: Date of harvest evaluation
+    :param prices: ETF prices - should include all harvestable ETFs
+    :param tax_params: Dict of tax parameters
+    :param sigmas: Asset volatilities
+    :param risk_free: Current risk-free rate
+    :param div_yields: Asset dividend yields
+    :param spreads: Bid/ask spreads
+    :param etf_set: All ETFs in this ETF set
+    :return: DataFrame with harvests to execute
     """
-    etf_sets = (('VTI', 'SCHB', 'ITOT', 'SPTM'),
-                ('VEA', 'SCHF', 'IEFA'))
+    all_lots = check_all_assets_for_restrictions(lots, prices,
+                                                 current_date)
+    lots = all_lots[all_lots['sellable']]
+    gains = (prices[lots['ticker']].values - lots['purchase_price'])
+    lots['gain'] = lots['quantity'] * gains
+    lots = lots[lots['gain'] < 0]
+    lots['hp'] = \
+        list(map(lambda d: (current_date - dt.date.fromisoformat(d)).days,
+                 lots['purchase_date']))
+    lots['tax_rate'] = tax_params['st_rate']
+    lt_lots = lots['hp'][lots['hp'] >= tax_params['lt_cutoff']].index
+    lots.loc[lt_lots, 'tax_rate'] = tax_params['lt_rate']
+    lots['tax_benefit'] = -lots['gain'] * lots['tax_rate']
+    lots = lots.sort_values(by='tax_benefit', ascending=False)
 
-    for s in etf_sets:
-        if ticker in s:
-            s = list(s)
-            s.remove(ticker)
-            return s
-    return []
+    tickers_by_benefit = lots.groupby('ticker')['tax_benefit'] \
+        .sum().sort_values().index.values
+    non_buyable = all_lots[all_lots['blocks_buy']]['ticker'].values
+    replacements = [_ for _ in etf_set if _ not in tickers_by_benefit
+                    and _ not in non_buyable]
+    replacements.extend(tickers_by_benefit)
+
+    harvests, buying, selling = {}, [], []
+    for i, lot in lots.iterrows():
+        ticker = lot['ticker']
+        lot_replacements = [_ for _ in replacements if _ != ticker
+                            and _ not in selling]
+        if ticker in buying or len(lot_replacements) == 0:
+            continue
+        replacement = lot_replacements[0]
+        result = evaluate_harvest(lot, replacement, current_date,
+                                  prices, tax_params, sigmas[ticker],
+                                  risk_free, div_yields[ticker], spreads)
+        if result is not None:
+            harvests[i] = result
+            buying.append(replacement)
+            selling.append(ticker)
+
+    return pd.DataFrame(harvests).T
 
 
-def evaluate_all_harvests(lots, current_date, prices, tax_params, sigmas,
-                          risk_free, div_yields, spreads):
-    """
+def evaluate_all_harvests(lots: pd.DataFrame, current_date: dt.date,
+                          prices: pd.Series, tax_params: Dict,
+                          sigmas: pd.Series, risk_free: float,
+                          div_yields: pd.Series, spreads: pd.Series,
+                          etf_sets: Union[Tuple, List]):
+    """ Generate harvesting trades for all currently-held assets
 
     :param lots: DataFrame of tax lots
     :param current_date: Date of harvest evaluation
@@ -444,35 +578,19 @@ def evaluate_all_harvests(lots, current_date, prices, tax_params, sigmas,
     :param risk_free: Current risk-free rate
     :param div_yields: Asset dividend yields
     :param spreads: Bid/ask spreads
+    :param etf_sets: Sets of exchangeable ETFs
     :return: DataFrame with harvests to execute
     """
-    all_lots = lots.copy()
-    lots = lots[lots['sell_price'] != lots['sell_price']].copy()
-    gains = (prices[lots['ticker']].values - lots['purchase_price'])
-    lots['gain'] = lots['quantity'] * gains
-    lots = lots[lots['gain'] < 0]
-    lots['hp'] =\
-        list(map(lambda d: (current_date - dt.date.fromisoformat(d)).days,
-                 lots['purchase_date']))
-    lots['tax_rate'] = tax_params['st_rate']
-    idx = lots['hp'][lots['hp'] >= tax_params['lt_cutoff']].index
-    lots.loc[idx, 'tax_rate'] = tax_params['lt_rate']
-    lots['tax_benefit'] = -lots['gain'] * lots['tax_rate']
-    lots = lots.sort_values(by='tax_benefit', ascending=False)
+    harvests = []
+    for etf_set in etf_sets:
+        set_lots = lots[lots['ticker'].isin(etf_set)]
+        if len(set_lots) == 0:
+            continue
+        set_harvests = \
+            evaluate_harvests_for_etf_set(set_lots, current_date, prices,
+                                          tax_params, sigmas, risk_free,
+                                          div_yields, spreads, etf_set)
+        if len(set_harvests) > 0:
+            harvests.append(set_harvests)
 
-    harvests, buying, selling = [], [], []
-    for i, lot in lots.iterrows():
-        ticker = lot['ticker']
-        replacements = get_replacement_set(ticker)
-        result = evaluate_harvest(lot, all_lots, replacements, current_date,
-                                  prices, tax_params, sigmas[ticker],
-                                  risk_free, div_yields[ticker], spreads,
-                                  selling)
-        if result is not None and ticker not in buying:
-            harvests.append(result)
-            buying.append(result['buy_ticker'])
-            selling.append(ticker)
-
-    harvests = pd.DataFrame(harvests)
-    return harvests
-
+    return pd.concat(harvests, ignore_index=True)
