@@ -25,8 +25,7 @@ class TrackingErrorConstraint(Constraint):
                  reference_weights: pd.Series,
                  sigma: pd.DataFrame,
                  upper_bound: float):
-        """ Tracking Error Constraint - create a constraint that will set
-        an upper bound on the tracking error between a subset of the
+        """ Constraint on the tracking error between a subset of the
         portfolio and a set of target weights
 
         :param asset_names: Names of all assets in the problem
