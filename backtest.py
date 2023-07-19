@@ -1,6 +1,7 @@
 import datetime as dt
 from typing import Dict, List, Union
 
+import numpy as np
 import pandas as pd
 import yfinance as yf
 
@@ -312,3 +313,42 @@ class Backtest:
                         'spread_costs': spread_costs / portfolio_value}
 
         return holdings, current_weights, pd.Series(current_info)
+
+
+def summarize_performance(daily_info: pd.DataFrame, params: BacktestParams):
+
+    starting_nav = params.starting_investment
+    start_date = daily_info.index.min()
+    end_date = daily_info.index.max()
+    n_years = (end_date - start_date).days / 365.25
+    ending_nav = daily_info.loc[end_date, 'portfolio_value']
+    mean_return = (ending_nav / starting_nav) ** (1 / n_years) - 1
+    daily_rets = daily_info['portfolio_value']
+    vol = daily_rets.pct_change().std() * np.sqrt(252)
+    turnover = np.sum(daily_info['turnover'].values[1:]) / n_years
+    spread_cost = np.sum(daily_info['spread_costs'].values[1:]) / n_years
+    tax_cost = np.sum(daily_info['tax'].values[1:]) / n_years
+    rebal_freq = np.sum(daily_info['turnover'] > 0) / n_years
+
+    return pd.Series({'Mean Return': mean_return, 'Volatility': vol,
+                      'Turnover': turnover, 'Spread Cost': spread_cost,
+                      'Tax Cost': tax_cost, 'Rebal Frequency': rebal_freq})
+
+
+def summarize_deviations(weights_df: pd.DataFrame, params: BacktestParams):
+
+    target_weights = params.target_weights
+    devs = weights_df - target_weights
+    mean_mean = devs.abs().apply(np.mean, axis=1).mean()
+    mean_max = devs.abs().apply(np.max, axis=1).mean()
+
+    return pd.Series({'Mean Avg Dev': mean_mean, 'Mean Max Dev': mean_max})
+
+
+def summarize_backtest(bt_result: list, bt_params: BacktestParams):
+
+    perf_summary = summarize_performance(bt_result[0], bt_params)
+    dev_summary = summarize_deviations(bt_result[1], bt_params)
+
+    return pd.concat((perf_summary, dev_summary))
+
