@@ -162,10 +162,8 @@ class SubsetWeightConstraint(LinearConstraint):
         """
         coefs = pd.Series(-rhs, asset_subset_names)
         coefs[target_asset_name] += 1
-        super(SubsetWeightConstraint, self).__init__(asset_names,
-                                                     coefs,
-                                                     0,
-                                                     direction)
+        super(SubsetWeightConstraint, self).__init__(asset_names, coefs,
+                                                     0, direction)
 
 
 class MeanVarianceOpt:
