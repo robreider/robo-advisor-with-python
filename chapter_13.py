@@ -1,596 +1,928 @@
 import datetime as dt
-from typing import Tuple, Dict, List, Union
+import itertools
+from typing import List, Dict, Union, Callable
 
+import cvxpy as cp
 import numpy as np
-from optionprice import Option
 import pandas as pd
+import scipy as sp
+import yfinance as yf
 
 
-def sellable(lot: pd.Series, new_lots: pd.Series) -> pd.Series:
-    """ Check whether a lot can be sold without creating a wash sale
+class Objective:
 
-    :param lot: Information about the tax lot
-    :param new_lots: Series containing purchase dates of newly-purchased
-        lots
-    :return: List of two elements. First element is True if the lot can be
-        sold without creating a wash sale. Second element is an array of
-        the purchase dates of the lots (if any) that prevent selling.
-    """
-
-    idx = ['sellable', 'blocking_lots']
-    if not lot['still_held']:
-        return pd.Series([False, pd.Series(dtype='str')], idx)
-
-    if not lot['is_at_loss']:
-        return pd.Series([True, pd.Series(dtype='str')], idx)
-
-    if lot['is_new'] and len(new_lots) > 1:
-        blocking_lots = new_lots[new_lots != lot.purchase_date]
-        return pd.Series([False, blocking_lots], idx)
-
-    if not lot['is_new'] and len(new_lots) > 0:
-        return pd.Series([False, new_lots], idx)
-
-    return pd.Series([True, pd.Series(dtype='str')], idx)
+    def generate_objective(self,
+                           date: dt.date,
+                           holdings: pd.DataFrame,
+                           variables: Dict,
+                           port_info: Dict):
+        pass
 
 
-def blocks_buying(lot: pd.Series, current_date: dt.date) -> bool:
-    """ Check whether a lot prevents us from buying an asset, because it
-    was recently sold at a loss
+class MinTaxObjective(Objective):
 
-    :param lot: Information about the tax lot
-    :param current_date: Current date
-    :return: True if the lot has been recently sold at a loss, False if not
-    """
+    def __init__(self,
+                 lt_gains_rate: float,
+                 income_rate: float,
+                 lt_cutoff_days=365):
+        self.lt_gains_rate = lt_gains_rate
+        self.income_rate = income_rate
+        self.lt_cutoff_days = lt_cutoff_days
 
-    if lot['still_held']:
-        return False
-    how_long = (current_date - dt.date.fromisoformat(lot['sell_date'])).days
+    def generate_objective(self,
+                           date: dt.date,
+                           holdings: pd.DataFrame,
+                           variables: Dict,
+                           port_info: Dict):
 
-    return how_long <= 30 and lot['sell_price'] < lot['purchase_price']
+        current_date = date
+        lt_cutoff_days = self.lt_cutoff_days
+        st_rate, lt_rate = self.income_rate, self.lt_gains_rate
 
-
-def check_asset_for_restrictions(lots: pd.DataFrame,
-                                 current_price: float,
-                                 current_date: dt.date) -> pd.DataFrame:
-    """ Check buying and selling eligibility for an asset
-
-    :param lots: tax lots
-    :param current_price: current asset price
-    :param current_date: current date
-    :return: Original lots with information about wash sales appended
-    """
-
-    lots = lots.copy()
-    ws_start = (current_date - dt.timedelta(days=30)).strftime('%Y-%m-%d')
-    lots['is_new'] = list(map(lambda x: x >= ws_start,
-                              lots['purchase_date']))
-    lots['is_at_loss'] = list(map(lambda x: current_price < x,
-                                  lots['purchase_price']))
-    lots['still_held'] = list(map(lambda x: x != x, lots['sell_date']))
-    new_lots = lots[lots['is_new'] & lots['still_held']]['purchase_date']
-    sellability = {i: sellable(lots.loc[i], new_lots) for i in lots.index}
-    lots = lots.join(pd.DataFrame(sellability).T)
-    buy_blocks = list(map(lambda x: blocks_buying(x[1], current_date),
-                          lots.iterrows()))
-    buy_blocks = pd.Series(buy_blocks, lots.index)
-    lots['blocks_buy'] = buy_blocks
-    lots.drop(['is_new', 'is_at_loss', 'still_held'], axis=1, inplace=True)
-
-    return lots
-
-
-def check_all_assets_for_restrictions(lots: pd.DataFrame,
-                                      current_prices: pd.Series,
-                                      current_date: dt.date):
-    """ Check buying and selling eligibility for an asset
-
-    :param lots: tax lots
-    :param current_prices: current asset price
-    :param current_date: current date
-    :return: Tuple of two values:
-        - First is a dataframe of lots with the 'can_sell' flag added
-        - Second is a Dict, with an entry for each asset indicating blocks
-    """
-    tickers = lots['ticker'].unique()
-    results = []
-    for ticker in tickers:
-        asset_lots = lots[lots['ticker'] == ticker].copy()
-        asset_res = \
-            check_asset_for_restrictions(asset_lots,
-                                         current_prices[ticker],
-                                         current_date)
-        results.append(asset_res)
-
-    results = pd.concat(results)
-    return results
-
-
-def create_new_lots(buys: Dict, current_date: dt.date,
-                    current_prices: pd.Series):
-    """ Create new tax lots from buy trades
-
-    :param buys: New purchases
-    :param current_date: The current date
-    :param current_prices: Current asset prices
-    :return: A data frame holding tax lot information for the purchases
-    """
-    new_lots = []
-    for ticker, buy_amount in buys.items():
-        idx = ['ticker', 'purchase_price', 'quantity', 'purchase_date',
-               'sell_price', 'sell_date', 'wash_sale']
-        new_lot = pd.Series([ticker, current_prices[ticker],
-                             buy_amount / current_prices[ticker],
-                             current_date.strftime('%Y-%m-%d'),
-                             np.NaN, np.NaN, False],
-                            index=idx)
-        new_lots.append(new_lot)
-
-    return pd.DataFrame(new_lots)
-
-
-def update_lots_with_buys(lots: pd.DataFrame,
-                          buys: Dict,
-                          current_date: dt.date,
-                          current_prices: pd.Series) -> Tuple:
-    """ Update existing lots with buys, adjusting cost basis for wash sales
-    where necessary
-
-    :param lots: Current holdings, with information about wash sale
-        restrictions
-    :param buys: Dictionary of buy trades, in dollars
-    :param current_date: The current date
-    :param current_prices: Current asset prices
-    :return: Three dataframes.
-        First is lots corresponding to new buys.
-        Second is closed lots from which we had to wash some but not all
-        losses.
-        Third is existing lots with adjustments for wash sales.
-    """
-
-    new_lots = create_new_lots(buys, current_date, current_prices)
-    leftover_lots = []
-    for new_idx, new_lot in new_lots.iterrows():
-        ticker_lots = lots[lots['ticker'] == new_lot['ticker']]
-        blocking_lots = ticker_lots[ticker_lots['blocks_buy']] \
-            .sort_values(by='purchase_date')
-        shares_to_wash = min(new_lot['quantity'],
-                             blocking_lots['quantity'].sum())
-        for i in blocking_lots.index:
-            lot = lots.loc[i].copy()
-            lot['wash_sale'] = True
-            if shares_to_wash < lot['quantity']:
-                leftover_lot = lots.loc[i].copy()
-                leftover_lot['quantity'] -= shares_to_wash
-                lot['quantity'] = shares_to_wash
-                shares_to_wash = 0
-                leftover_lots.append(leftover_lot)
+        sells = variables['sells']
+        tax = 0
+        for i in holdings.index:
+            lot_info = holdings.loc[i]
+            asset, date = lot_info['ticker'], lot_info['purchase_date']
+            purchase_date = dt.date.fromisoformat(date)
+            holding_period = (current_date - purchase_date).days
+            if holding_period <= lt_cutoff_days:
+                lot_rate = st_rate
             else:
-                shares_to_wash -= lot['quantity']
+                lot_rate = lt_rate
+            gain = lot_info['current_price'] / lot_info['purchase_price']
+            effective_rate = (gain - 1) * lot_rate
+            tax += sells[asset][date] * effective_rate
 
-            washed_loss = lot['quantity'] * (lot['purchase_price'] -
-                                             lot['sell_price'])
-            new_lots.loc[new_idx, 'purchase_price'] += washed_loss / \
-                                                       new_lot['quantity']
-            lots.loc[i] = lot
+        objective = cp.Minimize(tax)
 
-            if shares_to_wash == 0:
-                break
-    leftover_lots = pd.DataFrame(leftover_lots) \
-        .drop(['sellable', 'blocking_lots', 'blocks_buy'],
-              axis=1, errors='ignore')
-
-    return new_lots, leftover_lots, lots
+        return objective
 
 
-def update_lot(lot: pd.Series, idx: List[str], values: List):
-    """ Helper function to create a new lot by updating an existing one
+class MinTrackingErrorObjective(Objective):
 
-    :param lot: Series representing a tax lot
-    :param idx: List of indices to put the replacement data
-    :param values: replacement data
-    :return: A new lot with the replacement data in the right places
-    """
-    new_lot = lot.copy()
-    new_lot[idx] = values
-    return new_lot
+    def __init__(self,
+                 target_weights: pd.Series,
+                 sigma: pd.DataFrame):
+        self.target_weights = target_weights
+        self.sigma = sigma
+
+    def generate_objective(self,
+                           date: dt.date,
+                           holdings: pd.DataFrame,
+                           variables: Dict,
+                           port_info: Dict):
+        target_weights = self.target_weights
+        assets = target_weights.index
+        weights = pd.Series(variables['positions'])[assets] / \
+            port_info['investment_value']
+        sigma = self.sigma.loc[assets][assets]
+        diffs = weights - target_weights
+
+        objective = cp.Minimize(sum((sp.linalg.sqrtm(sigma) @ diffs) ** 2))
+
+        return objective
 
 
-def close_unblocked_lots(lots: pd.DataFrame, sells: Dict,
-                         current_date: dt.date, current_prices: pd.Series):
-    """ Update tax lots for sales that don't create any wash sales
+class Constraint:
 
-    :param lots: DataFrame of tax lots
-    :param sells: Dictionary of sells, by asset and purchase date
-    :param current_date: The current date
-    :param current_prices: Current asset prices
-    :return: Three DataFrames. First has closed tax lots. Second has
-        still-open lots. Third has sells that have not been accounted for
-        yet (because they could create washes)
-    """
-    lots = lots.copy()
-    closed_lots = []
-    remaining_sells = {k: {} for k in sells}
-    for ticker, ticker_sells in sells.items():
-        ticker_lots = lots[np.isnan(lots['sell_price']) *
-                           lots['ticker'] == ticker]
-        for purchase_date, sell_value in ticker_sells.items():
-            i = ticker_lots['purchase_date'].tolist().index(purchase_date)
-            i = ticker_lots.index[i]
-            sold_lot = lots.loc[i]
-            if len(sold_lot['blocking_lots']):
-                remaining_sells[ticker][sold_lot['purchase_date']] = \
-                    sell_value
+    def generate_constraint(self,
+                            date: dt.date,
+                            holdings: pd.DataFrame,
+                            variables: Dict,
+                            port_info: Dict) -> List:
+        pass
+
+
+class FullInvestmentConstraint(Constraint):
+
+    def __init__(self):
+        """ Constraint to enforce full investment """
+        pass
+
+    def generate_constraint(self, date, holdings, variables, port_info):
+        positions = variables['positions']
+        total_invested = sum(list(positions.values()))
+
+        return [total_invested == port_info['investment_value']]
+
+
+class LongOnlyConstraint(Constraint):
+
+    def __init__(self):
+        """ Constraint to enforce all portfolio holdings are non-negative
+        """
+        pass
+
+    def generate_constraint(self, date, holdings, variables, port_info):
+        return [v >= 0 for v in variables['positions'].values()]
+
+
+class DoNotIncreaseDeviationConstraint(Constraint):
+
+    def __init__(self,
+                 target_weights: pd.Series):
+        """ Constraint that prohibits buying in currently overweight assets
+        and selling in currently underweight assets
+
+        :param target_weights: target portfolio weights
+        """
+        self.target_weights = target_weights
+
+    def generate_constraint(self, date, holdings, variables, port_info):
+
+        all_assets = variables['buys'].keys()
+        current_port = holdings[['ticker', 'value']]. \
+            groupby(['ticker']). \
+            sum()['value']. \
+            reindex(list(all_assets)). \
+            fillna(0.0)
+
+        target_port = self.target_weights * port_info['investment_value']
+        cons = []
+        for asset in all_assets:
+            if current_port[asset] >= target_port[asset]:
+                cons.append(variables['buys'][asset] == 0)
+
+            if asset not in variables['sells']:
                 continue
-            sold_shares = sell_value / current_prices[ticker]
-            idx = ['quantity', 'sell_date', 'sell_price', 'wash_sale']
-            val = [sold_shares, current_date.strftime('%Y-%m-%d'),
-                   current_prices[ticker], not sold_lot['sellable']]
-            closed_lot = update_lot(sold_lot, idx, val)
-            closed_lots.append(closed_lot)
 
-            remaining_shares = sold_lot['quantity'] - sold_shares
-            if remaining_shares > 0:
-                remainder_lot = sold_lot.copy()
-                remainder_lot['quantity'] = remaining_shares
-                lots.loc[i] = remainder_lot
+            if current_port[asset] <= target_port[asset]:
+                for sell in variables['sells'][asset].values():
+                    cons.append(sell == 0)
+
+        return cons
+
+
+class DoNotTradePastTargetConstraint(Constraint):
+
+    def __init__(self,
+                 target_weights: pd.Series):
+        """ Prevent trading past the target weight.
+        Constrain positions of currently overweight assets to not be less
+        than the target, and positions of currently underweight assets
+        to not be more than the target.
+
+        :param target_weights: Weights of the target portfolio
+        """
+        self.target_weights = target_weights
+
+    def generate_constraint(self, date, holdings, variables, port_info):
+
+        positions = variables['positions']
+        all_assets = variables['buys'].keys()
+        current_port = holdings[['ticker', 'value']]. \
+            groupby(['ticker']). \
+            sum()['value']. \
+            reindex(list(all_assets)). \
+            fillna(0.0)
+
+        target_port = self.target_weights * port_info['investment_value']
+        cons = []
+        for asset in all_assets:
+            target_position = target_port[asset]
+            if current_port[asset] >= target_position:
+                cons.append(positions[asset] >= target_position)
+
+            if current_port[asset] <= target_position:
+                cons.append(positions[asset] <= target_position)
+
+        return cons
+
+
+class VolBasedDeviationConstraint(Constraint):
+
+    def __init__(self,
+                 target_weights: pd.Series,
+                 asset_vols: pd.Series,
+                 bounds: Union[float, pd.Series]):
+        """ Set deviation constraints on a per-asset basis, based on each
+        asset's volatility. Constraints are of the form
+
+            |h_i - t_i| <= vol_i * bounds_i
+
+        :param target_weights: Weights of the target portfolio
+        :param asset_vols: Volatility of each asset
+        :param bounds: Tolerances for each asset. If a single number is
+            passed, that value is used for all assets
+        """
+
+        self.target_weights = target_weights
+        self.asset_vols = asset_vols
+        self.bounds = bounds
+
+    def generate_constraint(self, date, holdings, variables, port_info):
+
+        positions = variables['positions']
+        all_assets = variables['buys'].keys()
+        investment_value = port_info['investment_value']
+        target_port = self.target_weights * investment_value
+        bounds = self.bounds
+        if not isinstance(bounds, pd.Series):
+            bounds = pd.Series(bounds, list(all_assets))
+
+        cons = []
+        for asset in all_assets:
+            lhs = cp.abs(positions[asset] - target_port[asset])
+            rhs = bounds[asset] * self.asset_vols[asset] * investment_value
+            cons.append(lhs <= rhs)
+
+        return cons
+
+
+class MaxDeviationConstraint(Constraint):
+
+    def __init__(self,
+                 target_weights: pd.Series,
+                 bounds: Union[float, pd.Series]):
+        """ Constrain each asset to be within a given tolerance of the
+        target
+
+        :param target_weights: Weights of the target portfolio
+        :param bounds: Amount of tolerance to allow in each asset's weight.
+            If a single number is passed, that value is used for all assets.
+        """
+
+        self.target_weights = target_weights
+        self.bounds = bounds
+
+    def generate_constraint(self, date, holdings, variables, port_info):
+
+        positions = variables['positions']
+        all_assets = variables['buys'].keys()
+        investment_value = port_info['investment_value']
+        target_port = self.target_weights * investment_value
+        bounds = self.bounds
+        if not isinstance(bounds, pd.Series):
+            bounds = pd.Series(bounds, list(all_assets))
+
+        cons = []
+        for asset in all_assets:
+            lhs = cp.abs(positions[asset] - target_port[asset])
+            rhs = bounds[asset] * investment_value
+            cons.append(lhs <= rhs)
+
+        return cons
+
+
+class RebalancingOpt:
+
+    def __init__(self,
+                 date: dt.date,
+                 target_port: pd.Series,
+                 holdings: pd.DataFrame,
+                 constraints: List[Constraint],
+                 objective: Objective):
+        """ Create an instance of an optimization problem to rebalance a
+        portfolio
+
+        :param date: current date
+        :param target_port: target portfolio, in dollars
+        :param holdings: holdings information, including share quantity,
+            price, ticker
+        :param constraints: constraints to apply in the problem
+        :param objective: objective to use in the problem
+        """
+
+        self.date = date
+        self.target_port = target_port
+        all_assets = target_port.index.values
+        if holdings.shape[0]:
+            all_assets = np.concatenate((all_assets,
+                                         holdings['ticker'].values))
+
+        self.assets = np.unique(all_assets)
+        self.holdings = holdings
+        self.variables = self._generate_variables(holdings)
+        cons = self._generate_constraints(constraints)
+        obj = self._generate_objective(objective)
+        self.prob = cp.Problem(obj, cons)
+
+    def _generate_variables(self, holdings):
+        all_assets = self.assets
+        variables = {'buys': {}, 'sells': {}, 'positions': {}}
+
+        asset_holdings = holdings[['ticker', 'value']]. \
+            groupby(['ticker']). \
+            sum()['value']. \
+            reindex(all_assets). \
+            fillna(0.0)
+
+        for asset in all_assets:
+            variables['buys'][asset] = cp.Variable(nonneg=True)
+
+        for i in holdings.index:
+            lot_info = holdings.loc[i]
+            asset, date = lot_info['ticker'], lot_info['purchase_date']
+            if asset not in variables['sells']:
+                variables['sells'][asset] = {}
+            variables['sells'][asset][date] = cp.Variable(nonneg=True)
+
+        for asset in all_assets:
+            variables['positions'][asset] = asset_holdings[asset] + \
+                                            variables['buys'][asset]
+            if asset in variables['sells']:
+                asset_sell = \
+                    sum([x for x in variables['sells'][asset].values()])
+                variables['positions'][asset] -= asset_sell
+
+        return variables
+
+    def _generate_constraints(self, constraints):
+        target_port = self.target_port
+        port_info = {'investment_value': target_port.sum()}
+        cons = [c.generate_constraint(self.date, self.holdings,
+                                      self.variables, port_info)
+                for c in constraints]
+
+        sell_size_cons = []
+        sells = self.variables['sells']
+        holdings = self.holdings
+        for i in holdings.index:
+            lot_info = holdings.loc[i]
+            asset, date = lot_info['ticker'], lot_info['purchase_date']
+            sell_size_cons.append(sells[asset][date] <= lot_info['value'])
+
+        cons = list(itertools.chain.from_iterable(cons))
+        cons.extend(sell_size_cons)
+
+        return cons
+
+    def _generate_objective(self, objective):
+        target_port = self.target_port
+        port_info = {'investment_value': target_port.sum()}
+        return objective.generate_objective(self.date, self.holdings,
+                                            self.variables, port_info)
+
+    def solve(self):
+        self.prob.solve()
+
+    def get_trades(self):
+        variables = self.variables
+
+        buys = {a: v.value for a, v in variables['buys'].items()}
+        buys = np.round(pd.Series(buys), 2)
+        sells = variables['sells']
+        sell_values = {}
+        for asset, asset_sells in sells.items():
+            asset_sells = {d: v.value for d, v in asset_sells.items()}
+            asset_sells = np.round(pd.Series(asset_sells), 2)
+            sell_values[asset] = asset_sells
+
+        return {'buys': buys, 'sells': sell_values}
+
+
+class Rebalancer:
+
+    def __init__(self, target_weights: pd.Series):
+        self.target_weights = target_weights
+
+    def rebalance(self,
+                  date: dt.date,
+                  holdings: pd.DataFrame,
+                  investment_value: float):
+        pass
+
+
+class SimpleRebalancer(Rebalancer):
+
+    def __init__(self,
+                 target_weights: pd.Series,
+                 tax_params: Dict):
+        super().__init__(target_weights)
+        self.tax_params = tax_params
+
+    def generate_complete_trades(self,
+                                 date: dt.date,
+                                 holdings: pd.DataFrame,
+                                 investment_value: float):
+        """ Calculate trades that would take the invested portfolio all
+        the way back to the target weights, then select tax-optimized
+        lots for sells. Trades are returned as dollar values.
+
+        :param date: current date
+        :param holdings: current holdings
+        :param investment_value: dollar amount to invest
+        :return: dictionary with buys and sells
+        """
+        asset_holdings = holdings[['ticker', 'value']]. \
+            groupby(['ticker']). \
+            sum()['value']. \
+            fillna(0.0)
+        target_values = self.target_weights * investment_value
+        full_index = asset_holdings.index.union(target_values.index)
+        trade_values = target_values.reindex(full_index).fillna(0) - \
+            asset_holdings.reindex(full_index).fillna(0)
+        buys = trade_values.where(trade_values > 0).dropna()
+        sells = trade_values.where(trade_values < 0).dropna().to_dict()
+
+        holdings = self.add_tax_info(holdings, date, self.tax_params)
+        for asset, asset_sale in sells.items():
+            asset_holdings = holdings[holdings['ticker'] == asset]
+            shares_to_sell = -1 * asset_sale / \
+                asset_holdings['current_price'].values[0]
+            sells_by_lot = self.select_lots_for_sale(shares_to_sell,
+                                                     asset_holdings)
+            sells[asset] = sells_by_lot
+
+        return {'buys': buys, 'sells': sells}
+
+    @staticmethod
+    def _empty_trades():
+        """ Gives empty trades in the right format
+        :return: Dictionary with buys and sells, but empty values
+        """
+        return {'buys': pd.Series(), 'sells': {}}
+
+    @staticmethod
+    def add_tax_info(lots: pd.DataFrame,
+                     current_date: dt.date,
+                     tax_params: Dict) -> pd.DataFrame:
+
+        tax_info = {}
+        for i in lots.index:
+            lot_info = lots.loc[i]
+            purchase_date = dt.date.fromisoformat(lot_info['purchase_date'])
+            holding_period = (current_date - purchase_date).days
+            if holding_period <= tax_params['lt_cutoff']:
+                lot_rate = tax_params['income_rate']
             else:
-                lots = lots.drop(i)
-    closed_lots = pd.DataFrame(closed_lots, columns=lots.columns)
+                lot_rate = tax_params['lt_gains_rate']
 
-    return closed_lots, lots, remaining_sells
+            purchase_price = lot_info['purchase_price']
+            gain = (lot_info['current_price'] / purchase_price - 1)
+            effective_rate = gain * lot_rate
+
+            tax_info[i] = pd.Series({'holding_period': holding_period,
+                                     'applicable_rate': lot_rate,
+                                     'pct_gain': gain,
+                                     'effective_rate': effective_rate})
+
+        tax_info = pd.DataFrame(tax_info).T
+
+        return lots.join(tax_info)
+
+    @staticmethod
+    def select_lots_for_sale(shares_to_sell: float,
+                             holdings: pd.DataFrame) -> Dict:
+        """ Choose which lots to sell from based on tax burden
+
+        :param shares_to_sell: number of shares of the asset to sell
+        :param holdings: holdings for this asset only
+        :return: dictionary keyed by lot date. values are dollar amounts to
+        sell from each lot
+        """
+
+        holdings = holdings.reset_index(drop=True)
+        order = holdings['effective_rate'].argsort().values
+        shares_available = holdings['quantity'].copy()
+
+        sells = {}
+        while shares_to_sell > 0:
+            current_best_lot = order[0]
+            best_lot_date = holdings['purchase_date'][current_best_lot]
+            if shares_available.iloc[current_best_lot] < shares_to_sell:
+                sell_value = shares_available[current_best_lot] \
+                             * holdings['current_price'][current_best_lot]
+                shares_to_sell -= shares_available[current_best_lot]
+                shares_available[current_best_lot] = 0
+                order = order[1:]
+            else:
+                shares_available[current_best_lot] -= shares_to_sell
+                sell_value = shares_to_sell * \
+                    holdings['current_price'][current_best_lot]
+                shares_to_sell = 0
+            sells[best_lot_date] = sell_value
+
+        return sells
 
 
-def calculate_remaining_quantities(lots: pd.DataFrame, sells: Dict,
-                                   current_prices: pd.Series):
-    """ Calculate the number of shares remaining in tax lots after any
-    sales
+class IntervalBasedRebalancer(SimpleRebalancer):
 
-    :param lots: DataFrame of tax lots
-    :param sells: Dictionary of sells, by asset and purchase date
-    :param current_prices: Current asset prices
-    :return: Copy of the tax lots with a new column showing the number of
-        shares that remain AFTER sales
+    def __init__(self,
+                 target_weights: pd.Series,
+                 rebalance_dates: List[dt.date],
+                 tax_params: Dict):
+        """
+
+        :param target_weights: weights of the target portfolio
+        :param rebalance_dates: list of dates on which the portfolio should
+            be rebalanced
+        :param tax_params: tax rates and long-term gains cutoff
+        """
+        super().__init__(target_weights, tax_params)
+        self.rebalance_dates = set(rebalance_dates)
+
+    def rebalance(self, date, holdings, investment_value):
+        if date not in self.rebalance_dates:
+            return self._empty_trades()
+
+        return self.generate_complete_trades(date, holdings,
+                                             investment_value)
+
+
+class ThresholdBasedRebalancer(SimpleRebalancer):
+
+    def __init__(self,
+                 target_weights: pd.Series,
+                 threshold_function: Callable,
+                 tax_params: Dict):
+        """ Rebalancer that trades all the way to the target when a
+        trigger is satisfied
+
+        :param target_weights: weights of the target portfolio
+        :param threshold_function: callable object that takes the current
+            and target weights of the portfolio, and returns a True or False
+            value indicating whether the portfolio should be rebalanced
+        :param tax_params: tax rates and long-term gains cutoff
+        """
+        super().__init__(target_weights, tax_params)
+        self.threshold_function = threshold_function
+
+    def rebalance(self, date, holdings, investment_value):
+        current_weights = holdings[['ticker', 'value']] \
+                              .groupby(['ticker']) \
+                              .sum()['value'] \
+                              / investment_value
+
+        if not self.threshold_function(current_weights,
+                                       self.target_weights):
+            return self._empty_trades()
+
+        return self.generate_complete_trades(date, holdings,
+                                             investment_value)
+
+
+class OptimizationBasedRebalancer(Rebalancer):
+
+    def __init__(self,
+                 target_weights: pd.Series,
+                 objective: Objective,
+                 constraints: List[Constraint]):
+        """ Rebalancer that generates rebalancing trades by solving
+        an optimization problem
+
+        :param target_weights: weights of the target portfolio
+        :param objective: objective for the optimization problem
+        :param constraints: constraints for the optimization problem
+        """
+        super().__init__(target_weights)
+        self.objective = objective
+        self.constraints = constraints
+
+    def rebalance(self, date, holdings, investment_value):
+        target_port = self.target_weights * investment_value
+        opt = RebalancingOpt(date,
+                             target_port,
+                             holdings,
+                             self.constraints,
+                             self.objective)
+        opt.solve()
+        trades = opt.get_trades()
+
+        return trades
+
+
+def get_dividends(assets: List[str]) -> Dict:
+    """ Get all the historical dividends for a set of assets
+
+    :param assets: list of tickers
+    :return: dictionary keyed by ticker, with a series of dividend values
     """
-    lots = lots.copy()
-    remaining_quantities = pd.Series(0, lots.index)
-    for (i, lot) in lots.iterrows():
-        if not np.isnan(lot['sell_date']):
-            continue
-        ticker = lot['ticker']
-        ticker_sells = sells.get(ticker, {})
-        purchase_date = lot['purchase_date']
-        lot_sale = ticker_sells.get(purchase_date, 0)
-        remaining_quantities[i] = \
-            lot['quantity'] - lot_sale / current_prices[ticker]
-    lots['remaining_quantity'] = remaining_quantities
+    div_dict = {}
+    for ticker in assets:
+        t = yf.Ticker(ticker)
+        divs = t.dividends
+        divs.index = pd.Index(map(lambda x: x.date(), divs.index))
+        div_dict[ticker] = divs
 
-    return lots
+    return div_dict
 
 
-def update_ticker_lots_with_wash_sells(lots, sells, current_date,
-                                       current_price):
-    """ Adjust lots for a single ticker for sales that could create washes
+def get_prices(assets: List[str],
+               start_date: str,
+               end_date: str) -> pd.DataFrame:
+    """ Retrieve historical prices for given assets
 
-    :param lots: Current holdings, with information about wash sale
-        restrictions
-    :param sells: Dictionary of asset sales (in dollars)
-    :param current_date: The current date
-    :param current_price: Current asset price
-    :return: Two data frames. First has newly closed lots, and second has
-        lots that are still open
+    :param assets: list of tickers
+    :param start_date: first date to get prices for
+    :param end_date: last date to get prices for
+    :return: DataFrame of prices - one asset per column, one day per row
     """
-    lots = lots.copy()
-    closed_lots, adjustments = [], []
-    blocking_lots = lots['blocking_lots']
-    idx = np.unique(np.concatenate([x.index.values for x in blocking_lots]))
-    blocking_shares = lots.loc[pd.Index(idx), 'remaining_quantity']
-    date_str = current_date.strftime('%Y-%m-%d')
-    for purchase_date, sell_value in sells.items():
-        i = lots.index[lots['purchase_date'].tolist().index(purchase_date)]
-        sold_lot = lots.loc[i]
-        shares_sold = sell_value / current_price
-        blocking_lots = sold_lot['blocking_lots'].sort_values()
-        blocks_idx = blocking_lots.index
-        shares_washed = \
-            min(shares_sold, blocking_shares[blocks_idx].sum())
-        loss_to_wash = shares_washed * \
-            (sold_lot['purchase_price'] - current_price)
+    prices = yf.download(assets, start_date, end_date)['Close']
+    prices.index = pd.Index(map(lambda x: x.date(), prices.index))
+    if isinstance(prices, pd.Series):
+        prices = pd.DataFrame(prices)
+        prices.columns = assets
 
-        idx = ['quantity', 'sell_date', 'sell_price', 'wash_sale']
-        if shares_washed > 0:
-            val = [shares_washed, date_str, current_price, True]
-            closed_lots.append(update_lot(sold_lot, idx, val))
-            adjustments.append((blocking_lots, loss_to_wash))
-            shares = blocking_shares[blocks_idx].cumsum() - shares_washed
-            blocking_shares[blocks_idx] = np.clip(shares, 0, np.Inf)
+    return prices
 
-        if shares_sold > shares_washed:
-            val = [shares_sold - shares_washed, date_str, current_price,
-                   False]
-            closed_lots.append(update_lot(sold_lot, idx, val))
 
-        if sold_lot['quantity'] > shares_sold:
-            remainder_lot = sold_lot.copy()
-            remainder_lot['quantity'] -= shares_sold
-            lots.loc[i] = remainder_lot
+class BacktestParams:
+
+    def __init__(self,
+                 target_weights: pd.Series,
+                 start_date: str,
+                 end_date: str,
+                 starting_investment: float,
+                 cash_buffer: float,
+                 tax_params: Dict,
+                 spreads: Union[pd.Series, float],
+                 rebalancer: Rebalancer):
+        self.target_weights = target_weights
+        self.start_date = start_date
+        self.end_date = end_date
+        self.starting_investment = starting_investment
+        self.cash_buffer = cash_buffer
+        self.rebalancer = rebalancer
+        self.spreads = spreads
+        self.tax_params = tax_params
+
+
+class Backtest:
+
+    def __init__(self,
+                 params: BacktestParams,
+                 prices: pd.DataFrame,
+                 dividends: Dict):
+        self.assets = list(params.target_weights.index.values)
+        self.prices = prices
+        self.dividends = dividends
+        self.params = params
+
+    def run(self):
+
+        params = self.params
+        cash = params.starting_investment
+        holdings = pd.DataFrame({'ticker': [],
+                                 'value': [],
+                                 'quantity': []})
+        rebalancer = params.rebalancer
+        prices = self.prices
+        dividends = self.dividends
+        daily_info, weights_df, in_weights_df = {}, {}, {}
+
+        for date in self.prices.index:
+            print(date)
+            current_prices = prices.loc[date]
+            holdings = self.mark_to_market(holdings, current_prices)
+            divs = self.calc_dividend_income(date, holdings, dividends)
+            cash += divs
+            portfolio_value = holdings['value'].sum() + cash
+            in_weights_df[date] = \
+                self.weights_from_holdings(holdings,
+                                           portfolio_value,
+                                           self.assets)
+
+            investment_value = portfolio_value * (1 - params.cash_buffer)
+            trades = rebalancer.rebalance(date, holdings,
+                                          investment_value)
+            trade_prices = self.calc_trade_prices(current_prices,
+                                                  params.spreads)
+            holdings, weights, info = \
+                self.get_current_data(date, holdings, cash, current_prices,
+                                      trades, trade_prices,
+                                      params.tax_params)
+            info['dividends'] = divs / info['portfolio_value']
+            daily_info[date] = info
+            weights_df[date] = weights
+            cash = info['cash']
+
+        weights_df = pd.DataFrame(weights_df).fillna(0.0).T
+        in_weights_df = pd.DataFrame(in_weights_df).fillna(0.0).T
+        daily_info = pd.DataFrame(daily_info).T
+
+        return daily_info, weights_df, in_weights_df, holdings
+
+    @staticmethod
+    def mark_to_market(holdings: pd.DataFrame,
+                       current_prices: pd.Series) -> pd.DataFrame:
+        """ Update holdings values with current prices
+
+        :param holdings: holdings information, including share quantity,
+            price, ticker
+        :param current_prices: current asset prices
+        :return: data frame of the same shape as the input, with the
+            price per share and total value updated to reflect the current
+            asset prices
+        """
+        holdings['current_price'] = \
+            current_prices[holdings['ticker']].values
+        holdings['value'] = holdings['current_price'] * holdings['quantity']
+
+        return holdings
+
+    @staticmethod
+    def weights_from_holdings(holdings: pd.DataFrame,
+                              portfolio_value: float,
+                              assets: List[str]) -> pd.Series:
+        """ Calculate weights of a portfolio
+
+        :param holdings: holdings information, including share quantity,
+            price, ticker
+        :param portfolio_value: value of holdings and cash
+        :param assets: all assets to calculate weights for
+        :return: Series containing current portfolio weights
+        """
+        weights = holdings[['ticker', 'value']]. \
+            groupby(['ticker']). \
+            sum()['value']. \
+            reindex(assets). \
+            fillna(0.0) / \
+            portfolio_value
+
+        return weights
+
+    @staticmethod
+    def calc_dividend_income(date: dt.date,
+                             holdings: pd.DataFrame,
+                             dividends: Dict) -> float:
+        """ Calculate how much dividend cash the portfolio generated today
+
+        :param date: current data
+        :param holdings: current portfolio holdings
+        :param dividends: full historical dividend information
+        :return: total dividend income for the day
+        """
+
+        if not holdings.shape[0]:
+            return 0.0
+
+        shares_by_asset = holdings[['ticker', 'quantity']]. \
+            groupby(['ticker']). \
+            sum()['quantity']
+
+        div_income = 0.0
+        assets = set(dividends.keys()). \
+            intersection(set(shares_by_asset.index))
+        for asset in assets:
+            try:
+                asset_div = dividends[asset][date]
+            except KeyError:
+                asset_div = 0.0
+            div_income += shares_by_asset[asset] * asset_div
+
+        return div_income
+
+    @staticmethod
+    def calculate_tax(purchase_price: float,
+                      sell_price: float,
+                      quantity: float,
+                      purchase_date: dt.date,
+                      sell_date: dt.date,
+                      tax_params: Dict) -> float:
+        """ Calculate tax due to a sale
+
+        :param purchase_price: per-share purchase price of the asset
+        :param sell_price: per-share sale price
+        :param quantity: number of shares old
+        :param purchase_date: date shares were purchased
+        :param sell_date: date shares are being sold
+        :param tax_params: tax rates and cutoff for long-term gains
+        :return: tax owed due to the sale. positive value means paying tax.
+        """
+        holding_period = (sell_date - purchase_date).days
+        if holding_period <= tax_params['lt_cutoff']:
+            tax_rate = tax_params['lt_gains_rate']
         else:
-            lots.drop(i, axis='index', inplace=True)
+            tax_rate = tax_params['income_rate']
 
-    for blocking_lots, wash_amount in adjustments:
-        for purchase_date in blocking_lots.values:
-            idx = lots[lots['purchase_date'] == purchase_date].index
-            if len(idx) == 0:
+        return (sell_price - purchase_price) * quantity * tax_rate
+
+    @staticmethod
+    def calc_trade_prices(current_prices: pd.Series,
+                          spreads: Union[float, pd.Series]):
+        """ Calculate prices for buys and sells, accounting for bid/ask
+        spreads
+
+        :param current_prices: asset prices for the day
+        :param spreads: assumed bid/ask spreads, expressed as percentages
+            of the prices
+        :return: dictionary with assumed prices for buys and sells
+        """
+        assets = current_prices.index
+        if not isinstance(spreads, pd.Series):
+            spreads = pd.Series(spreads, assets)
+        spreads = (spreads[assets] * current_prices).clip(lower=0.01)
+        buy_prices = current_prices + spreads / 2
+        sell_prices = current_prices - spreads / 2
+
+        return {'buy': buy_prices, 'sell': sell_prices}
+
+    @staticmethod
+    def get_current_data(date: dt.date,
+                         holdings: pd.DataFrame,
+                         cash: float,
+                         prices: pd.Series,
+                         trades: Dict,
+                         trade_prices: Dict,
+                         tax_params: Dict) -> tuple:
+        """ Current portfolio information after applying trades
+
+        :param date: current date
+        :param holdings: holdings information, including share quantity,
+            price, ticker
+        :param cash: amount of uninvested cash before any trading
+        :param prices: asset prices
+        :param trades: details on buy and sell trades
+        :param trade_prices: assumed transaction prices for buys and sells
+        :param tax_params: tax rates and holding period for long-term gains
+        :return: tuple with the following items:
+            - DataFrame of updated (after trading) holdings
+            - Series containing the current portfolio weights
+            - Series with some current information on the portfolio and
+            trading
+        """
+
+        buys = trades['buys'][trades['buys'] > 0]
+        buy_shares = (buys / prices[buys.index]).round(2)
+        buy_prices = trade_prices['buy'][buys.index]
+
+        buys = pd.DataFrame({'ticker': buys.index,
+                             'purchase_price': buy_prices,
+                             'current_price': prices[buys.index],
+                             'quantity': buy_shares.values})
+        buys = buys[buys['quantity'] > 0]
+        buys['purchase_date'] = date.isoformat()
+        buys['value'] = buys['quantity'] * buys['current_price']
+        spread_costs = (buy_prices * buy_shares).sum() - buys['value'].sum()
+        total_buy = (buys['quantity'] * buys['purchase_price']).sum()
+
+        sells = trades['sells']
+        total_sell, total_tax = 0, 0
+        for i in holdings.index:
+            asset = holdings['ticker'][i]
+            purchase_date = holdings['purchase_date'][i]
+            asset_sells = sells.get(asset, {})
+            lot_sale = asset_sells.get(purchase_date, 0)
+            if lot_sale == 0:
                 continue
-            adj_per_share = wash_amount / lots.loc[idx[0], 'quantity']
-            lots.loc[idx[0], 'purchase_price'] += adj_per_share
+            shares_sold = lot_sale / prices[asset]
+            holdings.loc[i, 'quantity'] -= shares_sold
+            purchase_date = dt.date.fromisoformat(purchase_date)
+            sell_price = trade_prices['sell'][asset]
+            spread_costs += shares_sold * (prices[asset] - sell_price)
+            tax = Backtest.calculate_tax(holdings['purchase_price'][i],
+                                         sell_price, shares_sold,
+                                         purchase_date, date,
+                                         tax_params)
+            total_sell += sell_price * shares_sold
+            total_tax += tax
 
-    return pd.DataFrame(closed_lots), lots
+        holdings = pd.concat([holdings, buys], ignore_index=True)
+        holdings = holdings[holdings['quantity'] > 0]
+        holdings['value'] = holdings['quantity'] * holdings['current_price']
+        print(holdings.shape)
 
+        cash += (total_sell - total_buy)
+        portfolio_value = holdings['value'].sum() + cash
+        assets = list(prices.index)
+        current_weights = Backtest.weights_from_holdings(holdings,
+                                                         portfolio_value,
+                                                         assets)
+        turnover = (total_sell + total_buy) / portfolio_value
+        current_info = {'portfolio_value': portfolio_value,
+                        'cash': cash,
+                        'turnover': turnover,
+                        'tax': total_tax / portfolio_value,
+                        'spread_costs': spread_costs / portfolio_value}
 
-def update_with_wash_sells(lots, sells, current_date, current_prices):
-    """ Adjust lots for sales (no wash sale adjustments)
-
-    :param lots: Current holdings, with information about wash sale
-        restrictions
-    :param sells: Dictionary of asset sales (in dollars)
-    :param current_date: The current date
-    :param current_prices: Current asset prices
-    :return: Two data frames. First has still-held lots, and second has
-        newly-closed lots.
-    """
-    lots = calculate_remaining_quantities(lots, sells, current_prices)
-    closed_lots, open_lots = [], []
-    for ticker, ticker_sells in sells.items():
-        ticker_lots = lots[lots['ticker'] == ticker]
-        price = current_prices[ticker]
-        ticker_res = \
-            update_ticker_lots_with_wash_sells(ticker_lots, ticker_sells,
-                                               current_date, price)
-        closed_lots.append(ticker_res[0])
-        open_lots.append(ticker_res[1])
-
-    return pd.concat(closed_lots), pd.concat(open_lots)
-
-
-def update_lots_for_sells(lots: pd.DataFrame,
-                          sells: Dict,
-                          current_date: dt.date,
-                          current_prices: pd.Series) -> Tuple:
-    """ Adjust lots for sells
-
-    :param lots: Current holdings, with information about wash sale
-        restrictions
-    :param sells: Dictionary of asset sales (in dollars)
-    :param current_date: The current date
-    :param current_prices: Current asset prices
-    :return: Two data frames. First has still-held lots with any adjustments
-        for wash sales. Second has newly-closed lots.
-    """
-    unblocked_res = \
-        close_unblocked_lots(lots, sells, current_date, current_prices)
-    updates = update_with_wash_sells(unblocked_res[1], unblocked_res[2],
-                                     current_date, current_prices)
-
-    closed_lots = pd.concat((unblocked_res[0], updates[0]))
-
-    return updates[1], closed_lots
+        return holdings, current_weights, pd.Series(current_info)
 
 
-def update_lots_with_trades(lots: pd.DataFrame,
-                            buys: Dict,
-                            sells: Dict,
-                            current_date: dt.date,
-                            current_prices: pd.Series) -> pd.DataFrame:
-    """ Modify tax lots to reflect buys and sells, with any necessary
-        adjustments for wash sales
+def summarize_performance(daily_info: pd.DataFrame, params: BacktestParams):
 
-    :param lots: Current holdings, with information about wash sale
-        restrictions
-    :param buys: Dictionary of asset buys (in dollars)
-    :param sells: Dictionary of asset sales (in dollars)
-    :param current_date: The current date
-    :param current_prices: Current asset prices
-    :return: Two data frames. First has still-held lots with any adjustments
-        for wash sales. Second has newly-closed lots.
-    """
-    lots, closed_lots = update_lots_for_sells(lots, sells, current_date,
-                                              current_prices)
-    new_lots, leftover_lots, lots = update_lots_with_buys(lots, buys,
-                                                          current_date,
-                                                          current_prices)
-    updated_lots = pd.concat((closed_lots, lots, leftover_lots, new_lots),
-                             ignore_index=True)
-    updated_lots.drop(['sellable', 'blocking_lots', 'blocks_buy',
-                       'remaining_quantity'], axis=1, inplace=True)
+    starting_nav = params.starting_investment
+    start_date = daily_info.index.min()
+    end_date = daily_info.index.max()
+    n_years = (end_date - start_date).days / 365.25
+    ending_nav = daily_info.loc[end_date, 'portfolio_value']
+    mean_return = (ending_nav / starting_nav) ** (1 / n_years) - 1
+    daily_rets = daily_info['portfolio_value']
+    vol = daily_rets.pct_change().std() * np.sqrt(252)
+    turnover = np.sum(daily_info['turnover'].values[1:]) / n_years
+    spread_cost = np.sum(daily_info['spread_costs'].values[1:]) / n_years
+    tax_cost = np.sum(daily_info['tax'].values[1:]) / n_years
+    rebal_freq = np.sum(daily_info['turnover'] > 0) / n_years
 
-    return updated_lots
+    return pd.Series({'Mean Return': mean_return, 'Volatility': vol,
+                      'Turnover': turnover, 'Spread Cost': spread_cost,
+                      'Tax Cost': tax_cost, 'Rebal Frequency': rebal_freq})
 
 
-def evaluate_tcost(lot: pd.Series, current_price: float,
-                   sell_spread: float, buy_spread: float,
-                   commission_rate: float = 0):
-    """ Evaluate a loss harvest based on the cost to execute it
+def summarize_deviations(weights_df: pd.DataFrame, params: BacktestParams):
 
-    :param lot: A single tax lot
-    :param current_price: Current price of the asset
-    :param sell_spread: Estimated bid/ask spread on the asset being sold
-    :param buy_spread: Estimated bid/ask spread on the asset being bought
-    :param commission_rate: Commission rate for trades
-    :return: Tax benefit less the cost of trading
-    """
-    trade_size = lot['quantity'] * current_price
-    spread_cost = (buy_spread + sell_spread) * trade_size
-    commission_cost = 2 * commission_rate * trade_size
+    target_weights = params.target_weights
+    devs = weights_df - target_weights
+    mean_mean = devs.abs().apply(np.mean, axis=1).mean()
+    mean_max = devs.abs().apply(np.max, axis=1).mean()
 
-    return lot['tax_benefit'] - (spread_cost + commission_cost)
+    return pd.Series({'Mean Avg Dev': mean_mean, 'Mean Max Dev': mean_max})
 
 
-def evaluate_opp_cost(lot: pd.Series, price: float, current_date: dt.date,
-                      tax_params: Dict, sigma: float, risk_free: float,
-                      div_yield: float):
-    """ Evaluate a loss harvest based on the opportunity cost vs the tax
-    benefit
+def summarize_backtest(bt_result: list, bt_params: BacktestParams):
 
-    :param lot: A single tax lot
-    :param price: Current asset price
-    :param current_date: Current date
-    :param tax_params: Dict with tax rates and cutoff
-    :param sigma: Volatility of the asset
-    :param risk_free: Risk-free rate
-    :param div_yield: Dividend yield of the asset
-    :return: Tax benefit less the opportunity cost of harvesting
-    """
-    purchase_date = dt.date.fromisoformat(lot['purchase_date'])
-    holding_period = (current_date - purchase_date).days
-    if holding_period >= tax_params['lt_cutoff']:
-        rate_now = rate_later = tax_params['lt_rate']
-    else:
-        rate_now = tax_params['st_rate']
-        rate_later = tax_params['lt_rate']
-    price = float(price)
+    perf_summary = summarize_performance(bt_result[0], bt_params)
+    dev_summary = summarize_deviations(bt_result[1], bt_params)
 
-    o_full = Option(european=False, kind='put', s0=price, k=price,
-                    t=30, sigma=sigma, r=risk_free, dv=div_yield)
-    p_full = o_full.getPrice('BT')
-
-    days_to_switch = tax_params['lt_cutoff'] - holding_period
-    if 0 < days_to_switch <= 30:
-        o_pre_switch = Option(european=False, kind='put', s0=price,
-                              k=price, t=days_to_switch, sigma=sigma,
-                              r=risk_free, dv=div_yield)
-        p_til_switch = o_pre_switch.getPrice('BT')
-        p_after_switch = p_full - p_til_switch
-
-        opp_cost = rate_now * p_til_switch + rate_later * p_after_switch
-    else:
-        opp_cost = rate_now * p_full
-
-    benefit = rate_now * (lot['purchase_price'] - price)
-
-    return benefit - opp_cost
-
-
-def evaluate_harvest(lot: pd.Series, replacement: str,
-                     current_date: dt.date, prices: pd.Series,
-                     tax_params: Dict, sigma: float, risk_free: float,
-                     div_yield: float, spreads: pd.Series):
-    """ Given a lot trading at a loss, decide whether or not the lot
-    should be harvested
-
-    :param lot: Tax lot being considered for harvesting
-    :param replacement: ETF to buy as a replacement
-    :param current_date: The current date
-    :param prices: Prices of all ETFs
-    :param tax_params: Tax rates and long-term/short-term cutoff
-    :param sigma: volatility of the ETF considered for harvesting
-    :param risk_free: Current risk-free rate
-    :param div_yield: Dividend yield of the ETF considered for harvesting
-    :param spreads: Assumed bid/ask spreads
-    :return: Harvest trade information
-    """
-    ticker = lot['ticker']
-    benefit_net_tcosts = evaluate_tcost(lot, prices[ticker],
-                                        spreads[ticker],
-                                        spreads[replacement])
-    benefit_net_oppcost = evaluate_opp_cost(lot, prices[ticker],
-                                            current_date,
-                                            tax_params,
-                                            sigma, risk_free, div_yield)
-    if min(benefit_net_tcosts, benefit_net_oppcost) < 0:
-        return None
-
-    value = lot['quantity'] * prices[ticker]
-    return pd.Series([ticker, lot['purchase_date'], value, replacement],
-                     ['ticker', 'purchase_date', 'amount', 'replacement'])
-
-
-def evaluate_harvests_for_etf_set(lots, current_date, prices, tax_params,
-                                  sigmas, risk_free, div_yields,
-                                  spreads, etf_set):
-    """ Decide whether or not to harvest eligible lots from holdings
-    belonging to one set of exchangeable ETFs
-
-    :param lots: DataFrame of tax lots for ETFs from one TLH set
-    :param current_date: Date of harvest evaluation
-    :param prices: ETF prices - should include all harvestable ETFs
-    :param tax_params: Dict of tax parameters
-    :param sigmas: Asset volatilities
-    :param risk_free: Current risk-free rate
-    :param div_yields: Asset dividend yields
-    :param spreads: Bid/ask spreads
-    :param etf_set: All ETFs in this ETF set
-    :return: DataFrame with harvests to execute
-    """
-    all_lots = check_all_assets_for_restrictions(lots, prices,
-                                                 current_date)
-    lots = all_lots[all_lots['sellable']]
-    gains = (prices[lots['ticker']].values - lots['purchase_price'])
-    lots['gain'] = lots['quantity'] * gains
-    lots = lots[lots['gain'] < 0]
-    lots['hp'] = \
-        list(map(lambda d: (current_date - dt.date.fromisoformat(d)).days,
-                 lots['purchase_date']))
-    lots['tax_rate'] = tax_params['st_rate']
-    lt_lots = lots['hp'][lots['hp'] >= tax_params['lt_cutoff']].index
-    lots.loc[lt_lots, 'tax_rate'] = tax_params['lt_rate']
-    lots['tax_benefit'] = -lots['gain'] * lots['tax_rate']
-    lots = lots.sort_values(by='tax_benefit', ascending=False)
-
-    tickers_by_benefit = lots.groupby('ticker')['tax_benefit'] \
-        .sum().sort_values().index.values
-    non_buyable = all_lots[all_lots['blocks_buy']]['ticker'].values
-    replacements = [_ for _ in etf_set if _ not in tickers_by_benefit
-                    and _ not in non_buyable]
-    replacements.extend(tickers_by_benefit)
-
-    harvests, buying, selling = {}, [], []
-    for i, lot in lots.iterrows():
-        ticker = lot['ticker']
-        lot_replacements = [_ for _ in replacements if _ != ticker
-                            and _ not in selling]
-        if ticker in buying or len(lot_replacements) == 0:
-            continue
-        replacement = lot_replacements[0]
-        result = evaluate_harvest(lot, replacement, current_date,
-                                  prices, tax_params, sigmas[ticker],
-                                  risk_free, div_yields[ticker], spreads)
-        if result is not None:
-            harvests[i] = result
-            buying.append(replacement)
-            selling.append(ticker)
-
-    return pd.DataFrame(harvests).T
-
-
-def evaluate_all_harvests(lots: pd.DataFrame, current_date: dt.date,
-                          prices: pd.Series, tax_params: Dict,
-                          sigmas: pd.Series, risk_free: float,
-                          div_yields: pd.Series, spreads: pd.Series,
-                          etf_sets: Union[Tuple, List]):
-    """ Generate harvesting trades for all currently-held assets
-
-    :param lots: DataFrame of tax lots
-    :param current_date: Date of harvest evaluation
-    :param prices: ETF prices - should include all harvestable ETFs
-    :param tax_params: Dict of tax parameters
-    :param sigmas: Asset volatilities
-    :param risk_free: Current risk-free rate
-    :param div_yields: Asset dividend yields
-    :param spreads: Bid/ask spreads
-    :param etf_sets: Sets of exchangeable ETFs
-    :return: DataFrame with harvests to execute
-    """
-    harvests = []
-    for etf_set in etf_sets:
-        set_lots = lots[lots['ticker'].isin(etf_set)]
-        if len(set_lots) == 0:
-            continue
-        set_harvests = \
-            evaluate_harvests_for_etf_set(set_lots, current_date, prices,
-                                          tax_params, sigmas, risk_free,
-                                          div_yields, spreads, etf_set)
-        if len(set_harvests) > 0:
-            harvests.append(set_harvests)
-
-    return pd.concat(harvests, ignore_index=True)
+    return pd.concat((perf_summary, dev_summary))
